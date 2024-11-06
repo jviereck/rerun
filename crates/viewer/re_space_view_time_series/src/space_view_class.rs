@@ -1,5 +1,6 @@
 use egui::ahash::{HashMap, HashSet};
 
+use egui::Vec2;
 use egui_plot::{Legend, Line, Plot, PlotPoint, Points};
 
 use re_chunk_store::TimeType;
@@ -56,6 +57,8 @@ pub struct TimeSeriesSpaceViewState {
     /// (e.g. to avoid `hello/x` and `world/x` both being named `x`), and this knowledge must be
     /// forwarded to the default providers.
     pub(crate) default_names_for_entities: HashMap<EntityPath, String>,
+
+    had_shared_viewport: bool,
 }
 
 impl Default for TimeSeriesSpaceViewState {
@@ -67,6 +70,7 @@ impl Default for TimeSeriesSpaceViewState {
             scalar_range: [0.0, 0.0].into(),
             time_offset: 0,
             default_names_for_entities: Default::default(),
+            had_shared_viewport: false,
         }
     }
 }
@@ -280,6 +284,10 @@ Display time series data in a plot.
         let blueprint_db = ctx.blueprint_db();
         let view_id = query.space_view_id;
 
+        // TODO(jviereck): Lookup the shared_id string from the state. For now,
+        // using a hardcoded value.
+        let shared_id = SpaceViewId::hashed_from_str("TimeSeriesShared");
+
         let plot_legend =
             ViewProperty::from_archetype::<PlotLegend>(blueprint_db, ctx.blueprint_query, view_id);
         let legend_visible = plot_legend.component_or_fallback::<Visible>(ctx, self, state)?;
@@ -359,6 +367,7 @@ Display time series data in a plot.
             .id(crate::plot_id(query.space_view_id))
             .auto_bounds([true, false].into()) // Never use y auto bounds: we dictated bounds via blueprint under all circumstances.
             .allow_zoom([true, !lock_y_during_zoom])
+            .allow_boxed_zoom(false)
             .x_axis_formatter(move |time, _| {
                 format_time(
                     time_type,
@@ -399,6 +408,19 @@ Display time series data in a plot.
 
         let mut is_resetting = false;
 
+        // HACK(jviereck): Using `ScalarAxis` to store shared axis data for now.
+        let sync_axis = ViewProperty::from_archetype::<ScalarAxis>(
+            blueprint_db,
+            ctx.blueprint_query,
+            shared_id,
+        );
+        let sync_xrange = sync_axis.component_or_empty::<Range1D>();
+
+        let mut xmin: f64 = 0.;
+        let mut xmax: f64 = 0.;
+
+        let mut was_interacted = false;
+
         let egui_plot::PlotResponse {
             inner: _,
             response,
@@ -416,14 +438,36 @@ Display time series data in a plot.
             }
 
             is_resetting = plot_ui.response().double_clicked();
+            was_interacted = plot_ui.response().dragged();
 
             let current_bounds = plot_ui.plot_bounds();
+            xmin = current_bounds.min()[0];
+            xmax = current_bounds.max()[0];
+
+            let mut current_auto = plot_ui.auto_bounds();
+
+            if let Ok(Some(range)) = sync_xrange.as_ref() {
+                xmin = range.start();
+                xmax = range.end();
+
+                // Disable auto-bounds when range is given.
+                current_auto[0] = false;
+                state.had_shared_viewport = true;
+            } else if state.had_shared_viewport {
+                // If there was a shared viewport before and it is no longer,
+                // then the view got reset. Cause a scale to content as it
+                // is done during reset.
+                state.had_shared_viewport = false;
+                is_resetting = true;
+            } else {
+                current_auto[0] = true;
+            }
+
             plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                [current_bounds.min()[0], y_range.start()],
-                [current_bounds.max()[0], y_range.end()],
+                [xmin, y_range.start()],
+                [xmax, y_range.end()],
             ));
 
-            let current_auto = plot_ui.auto_bounds();
             plot_ui.set_auto_bounds(
                 [
                     current_auto[0] || is_resetting,
@@ -564,6 +608,25 @@ Display time series data in a plot.
             }
 
             ui.paint_time_cursor(ui.painter(), &response, time_x, response.rect.y_range());
+        }
+
+        let mut was_zoomed = false;
+        let mut was_scrolled = false;
+
+        if response.contains_pointer() {
+            // Check if user zoomed.
+            was_zoomed = ui.input(|i| i.zoom_delta_2d()) != Vec2::new(1., 1.);
+
+            // Check if user scrolled.
+            was_scrolled = ui.input(|i| i.smooth_scroll_delta) != Vec2::ZERO;
+        }
+
+        if is_resetting {
+            sync_axis.reset_blueprint_component::<Range1D>(ctx);
+        } else if was_interacted || was_zoomed || was_scrolled {
+            let new_x_range =
+                Range1D::new(transform.bounds().min()[0], transform.bounds().max()[0]);
+            sync_axis.save_blueprint_component(ctx, &new_x_range);
         }
 
         Ok(())
