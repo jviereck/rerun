@@ -280,6 +280,10 @@ Display time series data in a plot.
         let blueprint_db = ctx.blueprint_db();
         let view_id = query.space_view_id;
 
+        // TODO(jviereck): Lookup the shared_id string from the state. For now,
+        // using a hardcoded value.
+        let shared_id = SpaceViewId::hashed_from_str("TimeSeriesShared");
+
         let plot_legend =
             ViewProperty::from_archetype::<PlotLegend>(blueprint_db, ctx.blueprint_query, view_id);
         let legend_visible = plot_legend.component_or_fallback::<Visible>(ctx, self, state)?;
@@ -399,6 +403,17 @@ Display time series data in a plot.
 
         let mut is_resetting = false;
 
+        // HACK(jviereck): Using `ScalarAxis` to store shared axis data for now.
+        let sync_axis = ViewProperty::from_archetype::<ScalarAxis>(
+            blueprint_db,
+            ctx.blueprint_query,
+            shared_id,
+        );
+        let sync_xrange = sync_axis.component_or_empty::<Range1D>();
+
+        let mut xmin: f64 = 0.;
+        let mut xmax: f64 = 0.;
+
         let egui_plot::PlotResponse {
             inner: _,
             response,
@@ -418,9 +433,17 @@ Display time series data in a plot.
             is_resetting = plot_ui.response().double_clicked();
 
             let current_bounds = plot_ui.plot_bounds();
+            xmin = current_bounds.min()[0];
+            xmax = current_bounds.max()[0];
+
+            if let Ok(Some(range)) = sync_xrange.as_ref() {
+                xmin = range.start();
+                xmax = range.end();
+            }
+
             plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                [current_bounds.min()[0], y_range.start()],
-                [current_bounds.max()[0], y_range.end()],
+                [xmin, y_range.start()],
+                [xmax, y_range.end()],
             ));
 
             let current_auto = plot_ui.auto_bounds();
@@ -564,6 +587,15 @@ Display time series data in a plot.
             }
 
             ui.paint_time_cursor(ui.painter(), &response, time_x, response.rect.y_range());
+        }
+
+        // The plot's x-range changes after the plot.show if the x-axis got
+        // dragged etc. Only update the blueprint if it changed to avoid
+        // old values overwriting new values.
+        if transform.bounds().min()[0] != xmin || transform.bounds().max()[0] != xmax {
+            let new_x_range =
+                Range1D::new(transform.bounds().min()[0], transform.bounds().max()[0]);
+            sync_axis.save_blueprint_component(ctx, &new_x_range);
         }
 
         Ok(())
